@@ -67,7 +67,7 @@ final class TranscriptionService {
     /// Language WhisperKit detected during the most recent `auto` transcription.
     /// `nil` when the last transcription used an explicit language code, or when
     /// no transcription has run yet. Cleared at the start of each new transcription.
-    private(set) var lastDetectedLanguage: String?
+    var lastDetectedLanguage: String?
 
     /// Non-nil when the last `loadModel` call found insufficient RAM.
     /// Cleared when a new `loadModel` call begins.
@@ -84,18 +84,18 @@ final class TranscriptionService {
     /// this carries the actual text so the user sees words as they appear.
     var liveSegments: [TranscriptSegment] = []
 
-    private var whisperKit: WhisperKit?
-    private var loadedModelName: String?
-    private var loadedModelRepo: String?
+    var whisperKit: WhisperKit?
+    var loadedModelName: String?
+    var loadedModelRepo: String?
 
     /// The currently running transcription. Stored so the caller can cancel it.
-    private var activeTask: Task<[TranscriptSegment], Error>?
-    private var dualTask: Task<DualSourceTranscriber.TranscriptionOutput, Error>?
-    private var cloudTask: Task<[LabeledSegment], Error>?
+    var activeTask: Task<[TranscriptSegment], Error>?
+    var dualTask: Task<DualSourceTranscriber.TranscriptionOutput, Error>?
+    var cloudTask: Task<[LabeledSegment], Error>?
 
     /// Idle-unload timer. Cancelled at the start of every transcription and
     /// rearmed at the end of every successful transcription.
-    private var idleUnloadTimer: Task<Void, Never>?
+    var idleUnloadTimer: Task<Void, Never>?
 
     /// Optional resource governor injected at app-root level. When nil,
     /// `TranscriptionBudget.standard` is used as a fallback.
@@ -252,68 +252,6 @@ final class TranscriptionService {
         }
     }
 
-    // MARK: - Apple SpeechAnalyzer (macOS 26+)
-
-    private func transcribeSpeechAnalyzer(
-        session: URL,
-        config: AppConfig,
-        timing: DualSourceTranscriber.TimingInfo
-    ) async throws -> String {
-        guard #available(macOS 26.0, *) else {
-            throw SpeechAnalyzerError.unsupportedOS
-        }
-        disarmIdleTimer()
-
-        progress = 0
-        micProgress = 0
-        sysProgress = 0
-        liveSegments = []
-        lastDetectedLanguage = nil
-
-        let onMicProgress: @Sendable (Double) -> Void = { value in
-            Task { @MainActor in self.applyMicProgress(value) }
-        }
-        let onSysProgress: @Sendable (Double) -> Void = { value in
-            Task { @MainActor in self.applySysProgress(value) }
-        }
-
-        defer {
-            progress = nil
-            micProgress = nil
-            sysProgress = nil
-        }
-
-        let output = try await SpeechAnalyzerTranscriber.transcribe(
-            session: session,
-            config: config,
-            timing: timing,
-            onMicProgress: onMicProgress,
-            onSysProgress: onSysProgress
-        )
-
-        if config.language == "auto", let detected = output.detectedLanguage, !detected.isEmpty {
-            lastDetectedLanguage = detected
-        }
-
-        liveSegments = output.segments.map(Self.toLiveSegment)
-        return TranscriptFormatter.formatDual(output.segments)
-    }
-
-    /// Read `timing.json` if present. Returns nil-anchored timing when the
-    /// file is missing; throws when the file exists but cannot be parsed so
-    /// data corruption is surfaced rather than masked.
-    private func readTiming(from session: URL) throws -> DualSourceTranscriber.TimingInfo {
-        let timingURL = session.appendingPathComponent("timing.json")
-        guard FileManager.default.fileExists(atPath: timingURL.path) else {
-            return .init(micStartEpoch: nil, sysStartEpoch: nil)
-        }
-        let metadata = try TimingMetadata.read(from: timingURL)
-        return .init(
-            micStartEpoch: metadata.micStartEpoch,
-            sysStartEpoch: metadata.sysStartEpoch
-        )
-    }
-
     // MARK: - Local (WhisperKit)
 
     private func transcribeLocal(
@@ -381,205 +319,6 @@ final class TranscriptionService {
 
         liveSegments = output.segments.map(Self.toLiveSegment)
         return TranscriptFormatter.formatDual(output.segments)
-    }
-
-    // MARK: - Cloud (OpenAI / Gemini)
-
-    /// Cloud-backend equivalent of the local dual-source path. Calls the API
-    /// once per present audio source, applies wall-clock offsets, tags mic
-    /// segments as `selfLabel` and sys segments as `otherLabel`, then
-    /// interleaves by start time.
-    private func transcribeCloud(
-        session: URL,
-        config: AppConfig,
-        timing: DualSourceTranscriber.TimingInfo,
-        backend: TranscriptionBackend
-    ) async throws -> String {
-        disarmIdleTimer()
-
-        let micURL = SourceAudioFiles.preferredURL(in: session, source: .mic)
-        let sysURL = SourceAudioFiles.preferredURL(in: session, source: .sys)
-        let mixedURL = session.appendingPathComponent("audio.m4a")
-        let hasMic = micURL != nil
-        let hasSys = sysURL != nil
-        let hasMixed = FileManager.default.fileExists(atPath: mixedURL.path)
-
-        let model = backend == .openai
-            ? config.openaiTranscriptionModel
-            : config.geminiTranscriptionModel
-
-        progress = 0
-        micProgress = hasMic ? 0 : nil
-        sysProgress = hasSys ? 0 : nil
-        micSnapshot = nil
-        sysSnapshot = nil
-        cloudBackendName = backend.displayName
-        liveSegments = []
-
-        let onMicProgress: @Sendable (CloudProgressTracker.Snapshot) -> Void = { snap in
-            Task { @MainActor in self.applyMicSnapshot(snap) }
-        }
-        let onSysProgress: @Sendable (CloudProgressTracker.Snapshot) -> Void = { snap in
-            Task { @MainActor in self.applySysSnapshot(snap) }
-        }
-        let dualCfg = CloudTranscriptionCoordinator.DualConfig(
-            backend: backend,
-            micURL: micURL,
-            sysURL: sysURL,
-            timing: timing,
-            model: model,
-            language: config.language,
-            selfLabel: config.audio.selfLabel,
-            otherLabel: config.audio.otherLabel,
-            onMicProgress: onMicProgress,
-            onSysProgress: onSysProgress
-        )
-        let task = Task.detached(priority: .userInitiated) { () -> [LabeledSegment] in
-            try Task.checkCancellation()
-            if hasMic || hasSys {
-                return try await CloudTranscriptionCoordinator.runDual(dualCfg)
-            }
-            guard hasMixed else { return [] }
-            return try await CloudTranscriptionCoordinator.runMixed(
-                backend: backend,
-                audioURL: mixedURL,
-                model: model,
-                language: config.language,
-                onProgress: onMicProgress
-            )
-        }
-        cloudTask = task
-
-        defer {
-            progress = nil
-            micProgress = nil
-            sysProgress = nil
-            micSnapshot = nil
-            sysSnapshot = nil
-            cloudBackendName = nil
-            cloudTask = nil
-        }
-
-        let appSegments = try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
-        }
-
-        liveSegments = appSegments.map(Self.toLiveSegment)
-        armIdleTimer(minutes: config.idleUnloadMinutes)
-        return TranscriptFormatter.formatDual(appSegments)
-    }
-
-    /// Transcribe an audio file to timestamped segments.
-    ///
-    /// The underlying WhisperKit call runs on a detached, user-initiated task
-    /// so the main actor is free to service UI events throughout. Progress
-    /// updates are throttled to ~10 Hz to avoid hammering SwiftUI's tracking.
-    ///
-    /// - Parameters:
-    ///   - audioURL: Path to the audio file (WAV, M4A, etc.).
-    ///   - language: Language code (e.g. "en") or "auto" for detection.
-    /// - Returns: Array of timestamped transcript segments.
-    func transcribe(
-        audioURL: URL,
-        language: String = "auto"
-    ) async throws -> [TranscriptSegment] {
-        disarmIdleTimer()
-
-        if whisperKit == nil || modelState != .loaded {
-            try await loadModel()
-        }
-
-        guard let kit = whisperKit else {
-            throw TranscriptionError.modelNotLoaded
-        }
-
-        progress = 0
-        liveSegments = []
-
-        // When language is known, skip Whisper's temperature-fallback cascade
-        // (up to 5 retries per chunk at increasing temperatures). The fallback
-        // is designed for mixed-language or noisy audio — with an explicit
-        // language it's pure overhead and can 5x the wall time.
-        //
-        // `skipSpecialTokens: true` is important: WhisperKit defaults to
-        // `false`, which leaks `<|startoftranscript|>`, `<|he|>`, `<|0.00|>`,
-        // `<|endoftext|>` tokens into `segment.text`. With VAD chunking those
-        // accumulate per chunk and make the transcript unreadable.
-        let explicitLanguage = language != "auto"
-        let options = DecodingOptions(
-            verbose: false,
-            language: explicitLanguage ? language : nil,
-            temperatureFallbackCount: explicitLanguage ? 0 : 5,
-            detectLanguage: !explicitLanguage,
-            skipSpecialTokens: true,
-            chunkingStrategy: .vad
-        )
-
-        // Throttled, main-actor-safe progress sink. The KVO callback can fire
-        // dozens of times per second; we only forward noticeable changes.
-        let progressSink = ProgressSink { [weak self] value in
-            Task { @MainActor in
-                self?.progress = value
-            }
-        }
-
-        let observation = kit.progress.observe(
-            \.fractionCompleted,
-            options: [.new]
-        ) { reported, _ in
-            progressSink.submit(reported.fractionCompleted)
-        }
-
-        // Stream discovered segments to the UI. WhisperKit invokes this from
-        // a background queue, so hop to the main actor before mutating state.
-        // Segments may arrive slightly out of order with VAD chunking — the
-        // view sorts by `start` before rendering.
-        kit.segmentDiscoveryCallback = { [weak self] segments in
-            let mapped = segments.map { seg in
-                TranscriptSegment(
-                    start: Double(seg.start),
-                    end: Double(seg.end),
-                    text: seg.text.trimmingCharacters(in: .whitespaces)
-                )
-            }
-            Task { @MainActor in
-                self?.liveSegments.append(contentsOf: mapped)
-            }
-        }
-
-        defer {
-            observation.invalidate()
-            kit.segmentDiscoveryCallback = nil
-            progress = nil
-            activeTask = nil
-        }
-
-        let audioPath = audioURL.path
-        let task = Task.detached(priority: .userInitiated) {
-            try Task.checkCancellation()
-            let results = try await kit.transcribe(
-                audioPath: audioPath,
-                decodeOptions: options
-            )
-            return results.flatMap(\.segments).map { segment in
-                TranscriptSegment(
-                    start: Double(segment.start),
-                    end: Double(segment.end),
-                    text: segment.text.trimmingCharacters(in: .whitespaces)
-                )
-            }
-        }
-        activeTask = task
-
-        let segments = try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
-        }
-        armIdleTimer(minutes: 10) // default; no config available in this path
-        return segments
     }
 
     /// Cancel any in-flight transcription. The returned task will throw
@@ -737,7 +476,7 @@ extension TranscriptionService {
 ///
 /// Sendable because WhisperKit's KVO callback crosses thread boundaries. We
 /// use an `NSLock` rather than an actor to keep the submit call synchronous.
-private final class ProgressSink: @unchecked Sendable {
+final class ProgressSink: @unchecked Sendable {
     private let lock = NSLock()
     private var lastValue: Double = -1
     private let emit: @Sendable (Double) -> Void
