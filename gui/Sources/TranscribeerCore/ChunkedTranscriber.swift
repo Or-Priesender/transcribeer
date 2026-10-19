@@ -55,15 +55,19 @@ public enum ChunkedTranscriber {
             return TranscriptionOutput(segments: [], detectedLanguage: nil)
         }
 
+        // Load straight from the cache when possible. A hub lookup would fail for
+        // models that aren't published in the repo (e.g. locally installed ivrit.ai).
+        let cachedFolder = WhisperModelCache.folder(variant: modelName, repo: modelRepo, downloadBase: downloadBase)
         let kitConfig = WhisperKitConfig(
             model: modelName,
             downloadBase: downloadBase,
             modelRepo: modelRepo,
+            modelFolder: cachedFolder?.path,
             verbose: false,
             logLevel: .none,
             prewarm: true,
             load: true,
-            download: true
+            download: cachedFolder == nil
         )
 
         if !budget.allowParallel {

@@ -149,6 +149,10 @@ private final class TaskBox: @unchecked Sendable {
 /// under the same `argmaxinc/whisperkit-coreml` prefix with no changes to TranscriptionService.
 @Observable @MainActor
 final class HebrewModelDownloader {
+    /// App-wide instance so every surface (Settings, onboarding, History)
+    /// observes the same in-flight download.
+    static let shared = HebrewModelDownloader()
+
     // MARK: - Public state
 
     private(set) var progress: Double?
