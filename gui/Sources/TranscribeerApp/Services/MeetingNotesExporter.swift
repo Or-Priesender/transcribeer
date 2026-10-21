@@ -53,7 +53,7 @@ enum MeetingNotesExporter {
         let base = "\(date)-\(slug(title, fallback: "meeting-\(timePart)"))"
         let meta = SessionManager.readMeta(session)
         let language = meta["detected_language"] as? String ?? meta["language"] as? String
-        let header = (title: title, date: date, language: language, sessionID: sessionID)
+        let header = Header(title: title, date: date, language: language, sessionID: sessionID)
 
         try removePreviousExports(of: sessionID, in: folder)
 
@@ -83,7 +83,12 @@ enum MeetingNotesExporter {
 
     // MARK: - Helpers
 
-    typealias Header = (title: String, date: String, language: String?, sessionID: String)
+    struct Header {
+        let title: String
+        let date: String
+        let language: String?
+        let sessionID: String
+    }
 
     static func frontmatter(_ header: Header, suffix: String, extra: [String] = []) -> String {
         var lines = [
