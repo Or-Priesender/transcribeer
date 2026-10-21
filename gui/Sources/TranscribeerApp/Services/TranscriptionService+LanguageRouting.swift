@@ -43,8 +43,8 @@ extension TranscriptionService {
     func routeAutoLanguage(session: URL, config: AppConfig) async -> AppConfig {
         guard config.language == "auto" else { return config }
 
-        let sources = SourceAudioFiles.Source.allCases.compactMap {
-            SourceAudioFiles.preferredURL(in: session, source: $0)
+        let sources = SourceAudioFiles.Source.allCases.compactMap { source in
+            SourceAudioFiles.preferredURL(in: session, source: source)
         }
         let audioURLs = sources.isEmpty ? [session.appendingPathComponent("audio.m4a")] : sources
 
