@@ -235,7 +235,8 @@ final class TranscriptionService {
 
         if modelRepo == nil, let entry = ModelManifest.all.first(where: { $0.id == canonical }) {
             try await HebrewModelDownloader.shared.download(entry)
-            guard let folder = WhisperModelCache.folder(variant: canonical, repo: nil, downloadBase: downloadBase) else {
+            let folder = WhisperModelCache.folder(variant: canonical, repo: nil, downloadBase: downloadBase)
+            guard let folder else {
                 throw TranscriptionError.modelNotFound(
                     model: canonical,
                     repo: entry.downloadURL.absoluteString,
